@@ -289,6 +289,7 @@ class STDiT3BlockWithCudaKernel(nn.Module):
         t0=None,  # t with timestamp=0
         T=None,  # number of frames
         S=None,  # number of pixel patches
+        timestep=None,  # PAB: current denoising timestep (unused in HW path, accepted for compatibility)
     ):
         # prepare modulate parameters
         B, N, C = x.shape
