@@ -1,0 +1,29 @@
+.local/
+logs/
+*.egg-info/
+__pycache__/
+*.pyc
+precomputed_text_embeds.pth
+
+# Compiled CUDA extensions
+*.so
+
+# Generated calibration data & model weights
+calib_data.pth
+spatial_blocks.11.pth
+
+# Generated images
+*.png
+
+# Backup files
+*.bak
+
+# Claude Code internal
+.agents/
+.codex/
+
+# VS Code workspace
+*.code-workspace
+
+# Flux logs
+examples/flux/logs/

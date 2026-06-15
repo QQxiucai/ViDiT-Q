@@ -119,4 +119,69 @@ class W8A8OF16LinearDynamicInputScale(nn.Module):
         )
 
         return output.view(*shape[:-1], self.out_features)
-    
+
+
+class W4A8OF16LinearDynamicInputScale(nn.Module):
+    """W4A8 Linear with per-channel-group weight quantization.
+
+    Uses the QServe W4A8 GEMM kernel (w4a8_of16_nobias_weight_asym_qserve).
+    Weight is packed as 2×4-bit values per INT8 byte with per-group (G=128) scales.
+    No bias support.
+    """
+
+    G = 128  # group size for per-group weight quantization
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        # Packed weight: [out_features, in_features // 2] INT8
+        self.register_buffer(
+            "weight",
+            torch.empty(out_features, in_features // 2, dtype=torch.int8),
+        )
+
+        # Per-group weight scales: [out_features, in_features // G] half2-packed
+        self.register_buffer(
+            "wscales",
+            torch.empty(out_features, in_features // self.G, dtype=torch.float16),
+        )
+
+        # Per-group weight zero-points: [out_features, in_features // G] half2-packed
+        self.register_buffer(
+            "w_szs",
+            torch.empty(out_features, in_features // self.G, dtype=torch.float16),
+        )
+
+    def forward(self, input: torch.Tensor, quant_params):
+        """W4A8 GEMM forward.
+
+        Args:
+            input: [M, K] INT8 activation
+            quant_params: QuantParams with scale_input [M] and sum_input [M]
+        Returns:
+            output: [M, N] FP16
+        """
+        import viditq_extension.qgemm as qgemm
+
+        shape = input.shape
+        K = shape[-1]
+        M = input.numel() // K
+        out_feats = torch.empty(M, self.out_features, dtype=torch.float16, device=input.device)
+
+        qgemm.w4a8_of16_nobias_weight_asym_qserve(
+            input.view(M, K).contiguous(),
+            self.weight,
+            self.wscales,
+            quant_params.scale_input[:M],
+            self.w_szs,
+            quant_params.sum_input[:M] if quant_params.has_sum_input else torch.zeros(M, dtype=torch.float16, device=input.device),
+            out_feats,
+        )
+        return out_feats.view(*shape[:-1], self.out_features)
+

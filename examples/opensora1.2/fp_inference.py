@@ -119,6 +119,28 @@ def main():
     if not precompute_text_embeds:
         text_encoder.y_embedder = model.y_embedder  # HACK: for classifier-free guidance
 
+    # == TeaCache wrapper (optional) ==
+    # Wrap model.forward with TeaCache global residual caching.
+    # Controlled by config: enable_teacache=True, teacache_thresh=0.10
+    if cfg.get("enable_teacache", False):
+        from teacache.teacache_wrapper import TeaCacheWrapper, TeaCacheConfig
+
+        _tc_thresh = cfg.get("teacache_thresh", 0.10)
+        _tc_coeff = cfg.get("teacache_coeff", None)
+        _tc_config = TeaCacheConfig(
+            rel_l1_thresh=_tc_thresh,
+            rescale_coefficients=_tc_coeff,
+        )
+        _wrapper = TeaCacheWrapper(model, _tc_config)
+        model.forward = _wrapper.forward
+        model.teacache_wrapper = _wrapper  # expose for stats queries
+
+        logger.info(
+            "TeaCache enabled: thresh=%.3f, coeff=%s",
+            _tc_thresh,
+            "default" if _tc_coeff is None else "custom",
+        )
+
     # == build scheduler ==
     scheduler = build_module(cfg.scheduler, SCHEDULERS)
 

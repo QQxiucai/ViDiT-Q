@@ -1,7 +1,9 @@
 import io
 import os
 import re
+import site
 import subprocess
+from pathlib import Path
 from typing import List, Set
 import warnings
 
@@ -13,7 +15,7 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
 ROOT_DIR = os.path.dirname(__file__)
 
 # Supported NVIDIA GPU architectures.
-SUPPORTED_ARCHS = {"8.0", "8.6", "8.7", "8.9", "9.0"}
+SUPPORTED_ARCHS = {"8.0", "8.6", "8.7", "8.9", "9.0", "12.0"}
 
 # Compiler flags.
 CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
@@ -34,6 +36,22 @@ NVCC_FLAGS += [f"-D_GLIBCXX_USE_CXX11_ABI={ABI}"]
 if CUDA_HOME is None:
     raise RuntimeError(
         "Cannot find CUDA_HOME. CUDA must be available to build the package.")
+
+
+def get_nvidia_include_dirs() -> List[str]:
+    include_dirs = []
+    for site_package in site.getsitepackages():
+        nvidia_dir = Path(site_package) / "nvidia"
+        if not nvidia_dir.exists():
+            continue
+        include_dirs.extend(
+            str(path) for path in nvidia_dir.glob("*/include")
+            if path.is_dir()
+        )
+    return include_dirs
+
+
+NVIDIA_INCLUDE_DIRS = get_nvidia_include_dirs()
 
 
 def get_nvcc_cuda_version(cuda_dir: str) -> Version:
@@ -131,10 +149,14 @@ if nvcc_cuda_version < Version("11.8"):
     if any(cc.startswith("9.0") for cc in compute_capabilities):
         raise RuntimeError(
             "CUDA 11.8 or higher is required for compute capability 9.0.")
+if nvcc_cuda_version < Version("12.8"):
+    if any(cc.startswith("12.0") for cc in compute_capabilities):
+        raise RuntimeError(
+            "CUDA 12.8 or higher is required for compute capability 12.0.")
 
 # Add target compute capabilities to NVCC flags.
 for capability in compute_capabilities:
-    num = capability[0] + capability[2]
+    num = capability.replace("+PTX", "").replace(".", "")
     NVCC_FLAGS += ["-gencode", f"arch=compute_{num},code=sm_{num}"]
     if capability.endswith("+PTX"):
         NVCC_FLAGS += ["-gencode", f"arch=compute_{num},code=compute_{num}"]
@@ -155,6 +177,7 @@ qgemm_extension = CUDAExtension(
         # w4a8
         "csrc/qgemm/w4a8/w4a8_per_channel_gemm_cuda_qserve.cu",
     ],
+    include_dirs=NVIDIA_INCLUDE_DIRS,
     extra_compile_args={
         "cxx": CXX_FLAGS,
         "nvcc": NVCC_FLAGS,
@@ -165,7 +188,8 @@ ext_modules.append(qgemm_extension)
 # Fuse kernels.
 fused_extension = CUDAExtension(
     name="viditq_extension.fused",
-    sources=["csrc/fused/pybind.cpp", "csrc/fused/fused.cu"],
+    sources=["csrc/fused/pybind.cpp", "csrc/fused/fused.cu", "csrc/fused/viditq_fused.cu"],
+    include_dirs=NVIDIA_INCLUDE_DIRS,
     extra_compile_args={
         "cxx": CXX_FLAGS,
         "nvcc": NVCC_FLAGS,

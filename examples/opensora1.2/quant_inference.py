@@ -110,9 +110,9 @@ def main():
                         hidden_size=1152, 
                         patch_size=(1, 2, 2), 
                         num_heads=16, 
-                        qk_norm=True,
-                        enable_flash_attn=True,
-                        enable_layernorm_kernel=False,  # no apex included
+                        qk_norm=cfg.model.get("qk_norm", True),
+                        enable_flash_attn=cfg.model.get("enable_flash_attn", False),
+                        enable_layernorm_kernel=cfg.model.get("enable_layernorm_kernel", False),  # no apex included
                         input_size=latent_size,
                         in_channels=vae.out_channels,
                         caption_channels=text_encoder.output_dim if not precompute_text_embeds else 4096,
@@ -133,22 +133,19 @@ def main():
     INFO: the quant inference.
     '''
     if_mixed_precision = isinstance(quant_config.weight.n_bits, ListConfig) or isinstance(quant_config.act.n_bits, ListConfig)
-    if if_mixed_precision:
-        model.bitwidth_refactor()
-        
+
     if_hardware = cfg.get("hardware", False)
     quant_weight_ckpt = cfg.get("quant_weight_ckpt", None)
     if if_hardware:  # use the cuda kernel
-        assert not if_mixed_precision, ("mixed precision is currently not supported in CUDA kernels")
+        # Mixed precision (W4A8/W8A8) is now supported via ViDiTQW4A8Linear and W4A8OF16LinearDynamicInputScale
         if quant_weight_ckpt is None:
             save_path = os.path.join(cfg.save_dir, 'int_weight.pt')
-            # INFO: always regenerate the int_weigjt
             quant_param_ckpt = torch.load(os.path.join(cfg.save_dir, "./quant_params.pth"), weights_only=True, map_location='cuda')
             model.load_quant_param_dict(quant_param_ckpt)
+            # Apply mixed precision bitwidth AFTER loading quant params (load resets n_bits)
+            if if_mixed_precision:
+                model.bitwidth_refactor()
             model.quantize_and_save_weight(save_path=save_path)
-            # if not os.path.exists(save_path):
-            # else:
-            #     logger.info('int_weight.pth exists, loading from the local file...')
             model.hardware_forward_refactor(load_path=save_path)
 
     else:  # use the algorithm simulation
@@ -156,6 +153,30 @@ def main():
         model.load_quant_param_dict(quant_param_ckpt)
     
     model.set_init_done()
+
+    # == TeaCache wrapper (optional) ==
+    # Wrap model.forward with TeaCache global residual caching.
+    # Works for both hardware (CUDA kernel) and software simulation paths,
+    # because STDiT3BlockWithCudaKernel has the same forward signature as STDiT3Block.
+    # Controlled by config: enable_teacache=True, teacache_thresh=0.30
+    if cfg.get("enable_teacache", False):
+        from teacache.teacache_wrapper import TeaCacheWrapper, TeaCacheConfig
+
+        _tc_thresh = cfg.get("teacache_thresh", 0.30)
+        _tc_coeff = cfg.get("teacache_coeff", None)
+        _tc_config = TeaCacheConfig(
+            rel_l1_thresh=_tc_thresh,
+            rescale_coefficients=_tc_coeff,
+        )
+        _wrapper = TeaCacheWrapper(model, _tc_config)
+        model.forward = _wrapper.forward
+        model.teacache_wrapper = _wrapper  # expose for stats queries
+
+        logger.info(
+            "TeaCache enabled on quantized path: thresh=%.3f, coeff=%s",
+            _tc_thresh,
+            "default" if _tc_coeff is None else "calibrated",
+        )
 
     logger.info(str(model))
 

@@ -1,30 +1,35 @@
-resolution = "512"
+resolution = "144p"
 aspect_ratio = "1:1"
-num_frames = 64
+num_frames = 120
 fps = 24
 frame_interval = 1
 save_fps = 24
-ptq_config='./configs/w4a8_mixed_precision.yaml'
-save_dir = "./logs/software_simulation_mp"
+ptq_config = "./configs/w4a8_mp_120f_5s.yaml"
+save_dir = "/home/rich/ViDiT-Q/.local/outputs/opensora_w4a8_hw_144p_120f_5s_10steps"
 seed = 42
 batch_size = 1
+num_sample = 1
+end_index = 1
 multi_resolution = "STDiT2"
-dtype = "fp16"  # when using cuda kernel, we cannot use the bf16
+dtype = "fp16"
 condition_frame_length = 5
 align = 5
+verbose = 1
 
 model = dict(
     type="STDiT3-XL/2",
     from_pretrained="/home/rich/ViDiT-Q/.local/models/hpcai-tech/OpenSora-STDiT-v3",
     qk_norm=True,
-    enable_flash_attn=True,
-    enable_layernorm_kernel=False,  # didnot install apex
+    enable_flash_attn=False,
+    enable_layernorm_kernel=False,
+    force_huggingface=True,
 )
 vae = dict(
     type="OpenSoraVAE_V1_2",
     from_pretrained="/home/rich/ViDiT-Q/.local/models/hpcai-tech/OpenSora-VAE-v1.2",
     micro_frame_size=17,
-    micro_batch_size=4,
+    micro_batch_size=1,
+    force_huggingface=True,
 )
 text_encoder = dict(
     type="t5",
@@ -34,15 +39,13 @@ text_encoder = dict(
 scheduler = dict(
     type="rflow",
     use_timestep_transform=True,
-    num_sampling_steps=30,
+    num_sampling_steps=10,
     cfg_scale=7.0,
 )
 
 aes = 6.5
 flow = None
-
-precompute_text_embeds = False
-prompt_path="./t2v_samples.txt"
-model_path="/home/rich/ViDiT-Q/.local/models"
-hardware = False  # whether use the cuda kernel inference
-# quant_weight_ckpt = None # use the default path for int_weight.pth
+precompute_text_embeds = True
+prompt_path = "./prompts.txt"
+model_path = "/home/rich/ViDiT-Q/.local/models"
+hardware = True

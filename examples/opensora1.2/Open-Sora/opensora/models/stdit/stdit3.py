@@ -46,12 +46,14 @@ class STDiT3Block(nn.Module):
         enable_flash_attn=False,
         enable_layernorm_kernel=False,
         enable_sequence_parallelism=False,
+        block_name=None,  # for PAB caching
     ):
         super().__init__()
         self.temporal = temporal
         self.hidden_size = hidden_size
         self.enable_flash_attn = enable_flash_attn
         self.enable_sequence_parallelism = enable_sequence_parallelism
+        self.block_name = block_name  # PAB: unique block identifier
 
         if self.enable_sequence_parallelism and not temporal:
             attn_cls = SeqParallelAttention
@@ -97,6 +99,7 @@ class STDiT3Block(nn.Module):
         t0=None,  # t with timestamp=0
         T=None,  # number of frames
         S=None,  # number of pixel patches
+        timestep=None,  # PAB: current denoising timestep (scalar int)
     ):
         # prepare modulate parameters
         B, N, C = x.shape
@@ -108,52 +111,87 @@ class STDiT3Block(nn.Module):
                 self.scale_shift_table[None] + t0.reshape(B, 6, -1)
             ).chunk(6, dim=1)
 
-        # modulate (attention)
-        x_m = t2i_modulate(self.norm1(x), shift_msa, scale_msa)
-        if x_mask is not None:
-            try:
-                assert (x_mask == False).sum() == 0  # assert always full mask
-            except:
-                import ipdb; ipdb.set_trace()
-            x_m_zero = t2i_modulate(self.norm1(x), shift_msa_zero, scale_msa_zero)
-            x_m = self.t_mask_select(x_mask, x_m, x_m_zero, T, S)
+        # ---- PAB: self-attention ----
+        from teacache.pab_mgr import enable_pab, if_broadcast_attn, get_attn, set_attn
+        broadcast_attn = False
+        if enable_pab() and timestep is not None:
+            broadcast_attn, _ = if_broadcast_attn(self.block_name, timestep, self.temporal)
 
-        # attention
-        if self.temporal:
-            x_m = rearrange(x_m, "B (T S) C -> (B S) T C", T=T, S=S)
-            x_m = self.attn(x_m)
-            x_m = rearrange(x_m, "(B S) T C -> B (T S) C", T=T, S=S)
+        if enable_pab() and broadcast_attn:
+            x_m_s = get_attn(self.block_name)
         else:
-            x_m = rearrange(x_m, "B (T S) C -> (B T) S C", T=T, S=S)
-            x_m = self.attn(x_m)
-            x_m = rearrange(x_m, "(B T) S C -> B (T S) C", T=T, S=S)
+            # modulate (attention)
+            x_m = t2i_modulate(self.norm1(x), shift_msa, scale_msa)
+            if x_mask is not None:
+                try:
+                    assert (x_mask == False).sum() == 0
+                except:
+                    import ipdb; ipdb.set_trace()
+                x_m_zero = t2i_modulate(self.norm1(x), shift_msa_zero, scale_msa_zero)
+                x_m = self.t_mask_select(x_mask, x_m, x_m_zero, T, S)
 
-        # modulate (attention)
-        x_m_s = gate_msa * x_m
-        if x_mask is not None:
-            x_m_s_zero = gate_msa_zero * x_m
-            x_m_s = self.t_mask_select(x_mask, x_m_s, x_m_s_zero, T, S)
+            # attention
+            if self.temporal:
+                x_m = rearrange(x_m, "B (T S) C -> (B S) T C", T=T, S=S)
+                x_m = self.attn(x_m)
+                x_m = rearrange(x_m, "(B S) T C -> B (T S) C", T=T, S=S)
+            else:
+                x_m = rearrange(x_m, "B (T S) C -> (B T) S C", T=T, S=S)
+                x_m = self.attn(x_m)
+                x_m = rearrange(x_m, "(B T) S C -> B (T S) C", T=T, S=S)
+
+            # modulate (attention)
+            x_m_s = gate_msa * x_m
+            if x_mask is not None:
+                x_m_s_zero = gate_msa_zero * x_m
+                x_m_s = self.t_mask_select(x_mask, x_m_s, x_m_s_zero, T, S)
+
+            if enable_pab():
+                set_attn(self.block_name, x_m_s)
 
         # residual
         x = x + self.drop_path(x_m_s)
 
-        # cross attention
-        x = x + self.cross_attn(x, y, mask)
+        # ---- PAB: cross-attention ----
+        from teacache.pab_mgr import if_broadcast_cross, get_cross, set_cross
+        broadcast_cross = False
+        if enable_pab() and timestep is not None:
+            broadcast_cross, _ = if_broadcast_cross(self.block_name, timestep)
 
-        # modulate (MLP)
-        x_m = t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)
-        if x_mask is not None:
-            x_m_zero = t2i_modulate(self.norm2(x), shift_mlp_zero, scale_mlp_zero)
-            x_m = self.t_mask_select(x_mask, x_m, x_m_zero, T, S)
+        if enable_pab() and broadcast_cross:
+            x = x + get_cross(self.block_name)
+        else:
+            x_cross = self.cross_attn(x, y, mask)
+            if enable_pab():
+                set_cross(self.block_name, x_cross)
+            x = x + x_cross
 
-        # MLP
-        x_m = self.mlp(x_m)
+        # ---- PAB: MLP ----
+        from teacache.pab_mgr import if_broadcast_mlp, get_mlp, set_mlp
+        broadcast_mlp = False
+        if enable_pab() and timestep is not None:
+            broadcast_mlp, _ = if_broadcast_mlp(self.block_name, timestep)
 
-        # modulate (MLP)
-        x_m_s = gate_mlp * x_m
-        if x_mask is not None:
-            x_m_s_zero = gate_mlp_zero * x_m
-            x_m_s = self.t_mask_select(x_mask, x_m_s, x_m_s_zero, T, S)
+        if enable_pab() and broadcast_mlp:
+            x_m_s = get_mlp(self.block_name)
+        else:
+            # modulate (MLP)
+            x_m = t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)
+            if x_mask is not None:
+                x_m_zero = t2i_modulate(self.norm2(x), shift_mlp_zero, scale_mlp_zero)
+                x_m = self.t_mask_select(x_mask, x_m, x_m_zero, T, S)
+
+            # MLP
+            x_m = self.mlp(x_m)
+
+            # modulate (MLP)
+            x_m_s = gate_mlp * x_m
+            if x_mask is not None:
+                x_m_s_zero = gate_mlp_zero * x_m
+                x_m_s = self.t_mask_select(x_mask, x_m_s, x_m_s_zero, T, S)
+
+            if enable_pab():
+                set_mlp(self.block_name, x_m_s)
 
         # residual
         x = x + self.drop_path(x_m_s)
@@ -267,6 +305,7 @@ class STDiT3(PreTrainedModel):
                     enable_flash_attn=config.enable_flash_attn,
                     enable_layernorm_kernel=config.enable_layernorm_kernel,
                     enable_sequence_parallelism=config.enable_sequence_parallelism,
+                    block_name=f"spatial.{i:02d}",  # PAB
                 )
                 for i in range(config.depth)
             ]
@@ -288,6 +327,7 @@ class STDiT3(PreTrainedModel):
                     # temporal
                     temporal=True,
                     rope=self.rope.rotate_queries_or_keys,
+                    block_name=f"temporal.{i:02d}",  # PAB
                 )
                 for i in range(config.depth)
             ]
@@ -423,9 +463,11 @@ class STDiT3(PreTrainedModel):
         x = rearrange(x, "B T S C -> B (T S) C", T=T, S=S)
 
         # === blocks ===
+        # PAB: extract scalar timestep for per-block caching decisions
+        ts_scalar = int(timestep[0].item()) if timestep is not None else None
         for spatial_block, temporal_block in zip(self.spatial_blocks, self.temporal_blocks):
-            x = auto_grad_checkpoint(spatial_block, x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S)
-            x = auto_grad_checkpoint(temporal_block, x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S)
+            x = auto_grad_checkpoint(spatial_block, x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S, timestep=ts_scalar)
+            x = auto_grad_checkpoint(temporal_block, x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S, timestep=ts_scalar)
 
         if self.enable_sequence_parallelism:
             x = rearrange(x, "B (T S) C -> B T S C", T=T, S=S)

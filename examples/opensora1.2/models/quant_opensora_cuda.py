@@ -7,12 +7,25 @@ import logging
 
 from timm.models.vision_transformer import Mlp
 import xformers.ops
+from xformers.ops import fmha
 from viditq_extension.nn.base import QuantParams
+
+# RTX 5080 / sm120: force cutlass backend (default Hopper kernel crashes)
+XFORMERS_CUTLASS_OP = (fmha.cutlass.FwOp, fmha.cutlass.BwOp)
+
+import os as _os
+def _get_xformers_op():
+    op_name = _os.environ.get("VIDITQ_XFORMERS_OP", "default").lower()
+    if op_name == "default":
+        return None
+    if op_name == "cutlass":
+        return XFORMERS_CUTLASS_OP
+    raise ValueError(f"Unsupported VIDITQ_XFORMERS_OP={op_name!r}; expected 'default' or 'cutlass'.")
+
 from viditq_extension.nn.qlinear import W8A8OF16LinearDynamicInputScale
 from viditq_extension.nn.layernorm import LayerNormGeneral
 import viditq_extension.fused as fused_kernels
 
-import logging
 logger = logging.getLogger(__name__)
 
 # From PyTorch internals
@@ -32,8 +45,70 @@ to_3tuple = _ntuple(3)
 to_4tuple = _ntuple(4)
 to_ntuple = _ntuple
     
+def _is_viditq_layer(module):
+    """Check if a module is a ViDiTQuantizedLinear (has channel_mask + rotation_matrix)."""
+    return (
+        hasattr(module, 'channel_mask') and module.channel_mask is not None
+        and hasattr(module, 'rotation_matrix') and module.rotation_matrix is not None
+    )
+
+
+def _is_viditq_attn_layer(full_name):
+    """Check if a layer name corresponds to a self-attention qkv or proj layer."""
+    return ".attn.qkv" in full_name or ".attn.proj" in full_name
+
+
 def quantize_and_save_weight_(submodule, full_name):
+    is_viditq = _is_viditq_layer(submodule)
+    is_viditq_attn = is_viditq and _is_viditq_attn_layer(full_name)
+
+    if not is_viditq:
+        # Standard layers: skip attn.qkv, attn.proj, cross_attn.kv_linear
+        # These stay as dequantized FP weights (used by software attention path)
+        if (
+            ".attn.qkv" in full_name
+            or ".attn.proj" in full_name
+            or ".cross_attn.kv_linear" in full_name
+        ):
+            # These layers are not replaced by W8A8 CUDA Linear modules below, so
+            # keep their weights in dequantized FP form for regular F.linear.
+            return
+    else:
+        # ViDiT-Q layers:
+        # - cross_attn.kv_linear: still uses software F.linear, skip
+        # - cross_attn.q_linear, cross_attn.proj: already replaced by CUDA kernel
+        #   (W8A8OF16LinearDynamicInputScale), process as INT8
+        # - mlp.fc1, mlp.fc2: already replaced by CUDA kernel, process as INT8
+        # - attn.qkv, attn.proj: software path for now (ViDiTQuantizedLinear),
+        #   apply FP16 precision alignment (channel_mask + rotation) and keep as
+        #   dequantized FP16 for F.linear compatibility
+        if ".cross_attn.kv_linear" in full_name:
+            return
+
     fp_weight = submodule.fp_module.weight.to(torch.float16)
+
+    # ---- ViDiT-Q weight preprocessing (offline, one-time) ----
+    if is_viditq and not is_viditq_attn:
+        # CUDA kernel layers (cross_attn.q_linear/proj, mlp.fc1/fc2):
+        # Apply channel_mask + rotation so the INT8 weight is consistent
+        # with the future ViDiT-Q fused activation kernel.
+        # NOTE: currently the CUDA kernel path does NOT apply ViDiT-Q
+        # preprocessing to activations, so weight preprocessing is disabled
+        # to maintain consistency. Enable when activation kernel is wired in.
+        pass  # reserved for future: fp_weight = apply_viditq_preprocessing(fp_weight)
+
+    if is_viditq_attn:
+        # Self-attention in ViDiT-Q blocks: apply preprocessing + export as INT8
+        # for ViDiTQW8A8Linear (hardware CUDA kernel path).
+        channel_mask = submodule.channel_mask.to(device=fp_weight.device, dtype=torch.float16)
+        rotation_matrix = submodule.rotation_matrix.to(device=fp_weight.device, dtype=torch.float16)
+        # Step 1: channel-wise scaling
+        fp_weight = fp_weight / channel_mask.reshape(1, -1)
+        # Step 2: Hadamard rotation in FP16 (matches forward pass precision)
+        fp_weight = torch.matmul(fp_weight, rotation_matrix)
+        # Fall through to standard INT8 quantization below
+        logger.debug("ViDiT-Q attn layer %s: pre-processed + exporting INT8 for ViDiTQW8A8Linear", full_name)
+
     # the viditq_extension.nn.qlinear use [C] as the scale shape, but the qdiff simulation code use [C, 1]
 
     submodule.w_quantizer.delta = submodule.w_quantizer.delta.view(-1).to(torch.float16)
@@ -41,13 +116,56 @@ def quantize_and_save_weight_(submodule, full_name):
     scale = submodule.w_quantizer.delta
     zero_point = submodule.w_quantizer.zero_point  # the cuda kernel code uses 128+zero_point
 
-    # INFO: the orginal module weight is the FP16 quantized dequant weight, 
-    # replace with INT weight, should update the state_dict
-    int_weight = torch.clamp(
-            torch.round(fp_weight / scale.view(-1,1)) - zero_point.view(-1,1),
-            -128, 127).to(torch.int8)  # kernel supports W8A8 only for now
-    submodule.weight.data = int_weight
-    
+    # Determine bitwidth: check if this layer should use W4A8
+    use_w4a8 = False
+    if hasattr(submodule, 'w_quantizer') and hasattr(submodule.w_quantizer, 'n_bits'):
+        use_w4a8 = (int(submodule.w_quantizer.n_bits) == 4)
+
+    if use_w4a8:
+        C_out, C_in = fp_weight.shape
+        G = 128  # QServe W4A8 kernel group size
+
+        # The QServe kernel packs wscales/w_szs as half2 pairs, which requires
+        # an even number of groups (C_in/G must be even).
+        # For hidden_size=1152: 1152/128=9 groups (odd) → skip W4A8, fall back to W8A8.
+        # For hidden_size=4608: 4608/128=36 groups (even) → OK for W4A8.
+        if (C_in // G) % 2 != 0:
+            logger.debug("W4A8 skipped for %s: odd groups (%d), falling back to W8A8",
+                         full_name, C_in // G)
+            use_w4a8 = False
+
+    if use_w4a8:
+        # W4A8: pack 2×4-bit weights per INT8 byte, per-group scales
+        C_out, C_in = fp_weight.shape
+        G = 128
+        num_groups = C_in // G
+
+        fp_groups = fp_weight.view(C_out, num_groups, G)
+        w_max = fp_groups.max(dim=-1).values
+        w_min = fp_groups.min(dim=-1).values
+        group_scale = torch.clamp((w_max - w_min) / 15.0, min=1e-8)
+        group_zp = torch.round(-w_min / group_scale).clamp(0, 15).to(torch.float16)
+
+        w_int4 = torch.clamp(
+            torch.round(fp_groups / group_scale.unsqueeze(-1)) + group_zp.unsqueeze(-1),
+            0, 15).to(torch.int8)
+
+        w_low = w_int4[:, :, 0::2]
+        w_high = w_int4[:, :, 1::2]
+        w_packed = ((w_high << 4) | (w_low & 0x0F)).view(C_out, C_in // 2).to(torch.int8)
+
+        submodule.weight.data = w_packed
+        group_scale = group_scale.reshape(C_out, num_groups).to(torch.float16)
+        group_zp = group_zp.reshape(C_out, num_groups).to(torch.float16)
+        submodule.register_buffer('wscales', group_scale.reshape(C_out, -1))
+        submodule.register_buffer('w_szs', group_zp.reshape(C_out, -1))
+    else:
+        # W8A8: standard per-channel INT8 quantization
+        int_weight = torch.clamp(
+                torch.round(fp_weight / scale.view(-1,1)) - zero_point.view(-1,1),
+                -128, 127).to(torch.int8)
+        submodule.weight.data = int_weight
+
     
 from opensora.models.layers.blocks import (
     Attention,
@@ -82,17 +200,21 @@ class STDiT3BlockWithCudaKernel(nn.Module):
         enable_layernorm_kernel=False,
         enable_sequence_parallelism=False,
         quant_params=None,
+        use_kernel_override=None,  # [attn, cross_attn, mlp] — override for ViDiT-Q blocks
     ):
         super().__init__()
-        
+
         self.quant_params = quant_params
-        
+
         self.temporal = temporal
         self.hidden_size = hidden_size
         self.enable_flash_attn = enable_flash_attn
         self.enable_sequence_parallelism = enable_sequence_parallelism
 
-        self.use_kernel = [False, True, True] 
+        if use_kernel_override is not None:
+            self.use_kernel = list(use_kernel_override)
+        else:
+            self.use_kernel = [False, True, True] 
 
         if self.enable_sequence_parallelism and not temporal:
             raise AssertionError
@@ -103,7 +225,9 @@ class STDiT3BlockWithCudaKernel(nn.Module):
             mha_cls = MultiHeadCrossAttentionWithCudaKernel if self.use_kernel[1] else MultiHeadCrossAttention
             
         if self.use_kernel[0]:
-            # self.norm1 = LayerNormGeneral(hidden_size, act_sum=True, eps=1e-6)
+            # When use_kernel[0]=True but attn uses ViDiTQW8A8Linear (which does its own
+            # ViDiT-Q quantization), we need norm1 to output FP16 (not pre-quantized INT8).
+            # Use standard layernorm without quantization fusion.
             self.norm1 = get_layernorm(hidden_size, eps=1e-6, affine=False, use_kernel=enable_layernorm_kernel)
             self.attn = attn_cls(
                 hidden_size,
@@ -179,8 +303,10 @@ class STDiT3BlockWithCudaKernel(nn.Module):
             
         # attention
         if self.use_kernel[0]:
-            residual = x
-            x_m = self.norm1(x, shift_msa, scale_msa, self.quant_params)  
+            # CUDA kernel self-attention path.
+            # norm1: standard LayerNorm (FP16 output, no pre-quantization)
+            # attn: uses AttentionWithCudaKernel which internally quantizes before GEMM
+            x_m = t2i_modulate(self.norm1(x), shift_msa, scale_msa)
             if self.temporal:
                 x_m = rearrange(x_m, "B (T S) C -> (B S) T C", T=T, S=S)
                 x_m = self.attn(x_m)
@@ -189,8 +315,9 @@ class STDiT3BlockWithCudaKernel(nn.Module):
                 x_m = rearrange(x_m, "B (T S) C -> (B T) S C", T=T, S=S)
                 x_m = self.attn(x_m)
                 x_m = rearrange(x_m, "(B T) S C -> B (T S) C", T=T, S=S)
-            # modulate (attention)
-            x = fused_kernels.gate_residual_fuse(x_m.view(-1, C), gate_msa.view(-1, C), residual.contiguous().view(-1, C)).reshape([B, N, C])
+            # modulate (attention) with fused gate+residual
+            residual = x
+            x = fused_kernels.gate_residual_fuse(x_m.contiguous().view(-1, C), gate_msa.view(-1, C), residual.contiguous().view(-1, C)).reshape([B, N, C])
         else:
             x_m = t2i_modulate(self.norm1(x), shift_msa, scale_msa)
             if self.temporal:
@@ -278,6 +405,10 @@ class AttentionWithCudaKernel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
+        # Detect input type: FP16 → ViDiT-Q path (internal quantization);
+        # INT8 → standard path (pre-quantized by caller).
+        input_is_fp16 = (x.dtype == torch.float16)
+
         # flash attn is not memory efficient for small sequences, this is empirical
         enable_flash_attn = self.enable_flash_attn and (N > B)
         qkv = self.qkv(x, self.quant_params)
@@ -330,8 +461,15 @@ class AttentionWithCudaKernel(nn.Module):
         if not enable_flash_attn:
             x = x.transpose(1, 2)
         x = x.reshape(x_output_shape)
-        x = fused_kernels.quant_sum(x, self.quant_params.sum_input, self.quant_params.scale_input)
-        x = self.proj(x, self.quant_params)
+
+        if input_is_fp16:
+            # ViDiT-Q path: proj handles its own quantization (FP16→ViDiT-Q→INT8→GEMM)
+            x = self.proj(x, self.quant_params)
+        else:
+            # Standard path: quantize attention output before proj
+            x = fused_kernels.quant_sum(x, self.quant_params.sum_input, self.quant_params.scale_input)
+            x = self.proj(x, self.quant_params)
+
         x = self.proj_drop(x)
         return x
     
@@ -362,7 +500,7 @@ class MultiHeadCrossAttentionWithCudaKernel(nn.Module):
         attn_bias = None
         if mask is not None:
             attn_bias = xformers.ops.fmha.BlockDiagonalMask.from_seqlens([N] * B, mask)
-        x = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=attn_bias).view(B, N, C)
+        x = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=attn_bias, op=_get_xformers_op()).view(B, N, C)
 
         x = fused_kernels.quant_sum(x, self.quant_params.sum_input, self.quant_params.scale_input)
         x = self.proj(x, self.quant_params)

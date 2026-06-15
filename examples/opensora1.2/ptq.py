@@ -108,9 +108,9 @@ def main():
                         hidden_size=1152, 
                         patch_size=(1, 2, 2), 
                         num_heads=16, 
-                        qk_norm=True,
-                        enable_flash_attn=True,
-                        enable_layernorm_kernel=False,  # no apex included
+                        qk_norm=cfg.model.get("qk_norm", True),
+                        enable_flash_attn=cfg.model.get("enable_flash_attn", False),
+                        enable_layernorm_kernel=cfg.model.get("enable_layernorm_kernel", False),  # no apex included
                         input_size=latent_size,
                         in_channels=vae.out_channels,
                         caption_channels=text_encoder.output_dim if not precompute_text_embeds else 4096,

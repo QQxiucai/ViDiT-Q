@@ -1,0 +1,15 @@
+model:
+    model_id: "opensora"
+    model_type: 'opensora'  # ['sd','sdxl']
+remain_fp_regex: embedder|adaLN_modulation|final_layer|t_block
+viditq:
+  alpha: 0.75
+  layer_name_regex: 11|12|13|14
+calib_data:
+  save_path: /home/rich/ViDiT-Q/.local/outputs/opensora_w8a8_144p_120f_5s_10steps/calib_data.pth
+weight:
+  n_bits: 8
+  sym: False
+act:
+  n_bits: 8
+  sym: True

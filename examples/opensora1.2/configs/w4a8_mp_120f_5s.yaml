@@ -1,0 +1,22 @@
+model:
+    model_id: "opensora"
+    model_type: 'opensora'  # ['sd','sdxl']
+remain_fp_regex: embedder|adaLN_modulation|final_layer|t_block
+mixed_precision:
+  weight:
+    layer_name_regex: ['embedder|adaLN_modulation|final_layer|t_block|cross','','11|12|13|14','mlp']
+  act:
+    layer_name_regex: ['embedder|adaLN_modulation|final_layer|t_block|cross','','11|12|13|14','mlp']
+viditq:
+  alpha: 0.5665
+  layer_name_regex: 11|12|13|14
+calib_data:
+  save_path: /home/rich/ViDiT-Q/.local/outputs/opensora_w4a8_mp_144p_120f_5s_10steps/calib_data.pth
+weight:
+  n_bits: [2,4,8]
+  i_bitwidth: 2
+  sym: False
+act:
+  n_bits: [2,4,8]
+  i_bitwidth: 2
+  sym: True

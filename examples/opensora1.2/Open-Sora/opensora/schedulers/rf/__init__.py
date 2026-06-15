@@ -76,6 +76,12 @@ class RFLOW:
         if self.use_timestep_transform:
             timesteps = [timestep_transform(t, additional_args, num_timesteps=self.num_timesteps) for t in timesteps]
 
+        # TeaCache: pass the list of all timestep values (as ints) to the model
+        # so it can detect first/last step for cache policy.
+        # The model receives this via **kwargs.
+        all_timesteps = [int(t[0].item()) for t in timesteps]
+        model_args["all_timesteps"] = all_timesteps
+
         if mask is not None:
             noise_added = torch.zeros_like(mask, dtype=torch.bool)
             noise_added = noise_added | (mask == 1)

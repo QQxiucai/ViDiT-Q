@@ -11,6 +11,7 @@
 
 import functools
 import math
+import os
 from typing import Optional
 
 import numpy as np
@@ -20,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import xformers.ops
+from xformers.ops import fmha
 from einops import rearrange
 from timm.models.vision_transformer import Mlp
 
@@ -27,6 +29,16 @@ from opensora.acceleration.communications import all_to_all, split_forward_gathe
 from opensora.acceleration.parallel_states import get_sequence_parallel_group
 
 approx_gelu = lambda: nn.GELU(approximate="tanh")
+XFORMERS_CUTLASS_OP = (fmha.cutlass.FwOp, fmha.cutlass.BwOp)
+
+
+def _get_xformers_op():
+    op_name = os.environ.get("VIDITQ_XFORMERS_OP", "default").lower()
+    if op_name == "default":
+        return None
+    if op_name == "cutlass":
+        return XFORMERS_CUTLASS_OP
+    raise ValueError(f"Unsupported VIDITQ_XFORMERS_OP={op_name!r}; expected 'default' or 'cutlass'.")
 
 
 class LlamaRMSNorm(nn.Module):
@@ -202,6 +214,17 @@ class Attention(nn.Module):
                 softmax_scale=self.scale,
                 causal=self.is_causal,
             )
+            x_is_bnhd = True
+        elif not self.is_causal:
+            # RTX 5080 / sm120 上 xFormers default dispatch 会选到不稳定 kernel；
+            # 显式 cutlass 可以避免 CUDA invalid argument，并替代手写 fp16 softmax 的 NaN 风险。
+            q = q.permute(0, 2, 1, 3)
+            k = k.permute(0, 2, 1, 3)
+            v = v.permute(0, 2, 1, 3)
+            x = xformers.ops.memory_efficient_attention(
+                q, k, v, p=self.attn_drop.p, op=_get_xformers_op(), scale=self.scale
+            )
+            x_is_bnhd = True
         else:
             dtype = q.dtype
             q = q * self.scale
@@ -215,9 +238,10 @@ class Attention(nn.Module):
             attn = attn.to(dtype)  # cast back attn to original dtype
             attn = self.attn_drop(attn)
             x = attn @ v
+            x_is_bnhd = False
 
         x_output_shape = (B, N, C)
-        if not enable_flash_attn:
+        if not x_is_bnhd:
             x = x.transpose(1, 2)
         x = x.reshape(x_output_shape)
         x = self.proj(x)
@@ -330,7 +354,9 @@ class KVCompressAttention(nn.Module):
             if mask is not None:
                 attn_bias = torch.zeros([B * self.num_heads, q.shape[1], k.shape[1]], dtype=q.dtype, device=q.device)
                 attn_bias.masked_fill_(mask.squeeze(1).repeat(self.num_heads, 1, 1) == 0, float("-inf"))
-            x = xformers.ops.memory_efficient_attention(q, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
+            x = xformers.ops.memory_efficient_attention(
+                q, k, v, p=self.attn_drop.p, attn_bias=attn_bias, op=_get_xformers_op()
+            )
         else:
             # (B, N, #heads, #dim) -> (B, #heads, N, #dim)
             q = q.permute(0, 2, 1, 3)
@@ -474,7 +500,35 @@ class MultiHeadCrossAttention(nn.Module):
         attn_bias = None
         if mask is not None:
             attn_bias = xformers.ops.fmha.BlockDiagonalMask.from_seqlens([N] * B, mask)
-        x = xformers.ops.memory_efficient_attention(q, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
+        x = xformers.ops.memory_efficient_attention(
+            q, k, v, p=self.attn_drop.p, attn_bias=attn_bias, op=_get_xformers_op()
+        )
+        # 这是为了暂时跑冒烟推理的选择：RTX 5080 / sm120 当前会在 xformers
+        # default dispatch 内部触发 CUDA invalid argument；上面改为显式 cutlass 后，
+        # 保留这段 PyTorch 原生 attention fallback 作为临时回退参考。
+        # if mask is not None:
+        #     outputs = []
+        #     cond_start = 0
+        #     for i, cond_len in enumerate(mask):
+        #         q_i = q[:, i * N : (i + 1) * N].permute(0, 2, 1, 3)
+        #         k_i = k[:, cond_start : cond_start + cond_len].permute(0, 2, 1, 3)
+        #         v_i = v[:, cond_start : cond_start + cond_len].permute(0, 2, 1, 3)
+        #         cond_start += cond_len
+        #         out_i = F.scaled_dot_product_attention(
+        #             q_i,
+        #             k_i,
+        #             v_i,
+        #             dropout_p=self.attn_drop.p if self.training else 0.0,
+        #         ).permute(0, 2, 1, 3)
+        #         outputs.append(out_i)
+        #     x = torch.cat(outputs, dim=1)
+        # else:
+        #     x = F.scaled_dot_product_attention(
+        #         q.permute(0, 2, 1, 3),
+        #         k.permute(0, 2, 1, 3),
+        #         v.permute(0, 2, 1, 3),
+        #         dropout_p=self.attn_drop.p if self.training else 0.0,
+        #     ).permute(0, 2, 1, 3)
 
         x = x.view(B, -1, C)
         x = self.proj(x)
@@ -522,7 +576,9 @@ class SeqParallelMultiHeadCrossAttention(MultiHeadCrossAttention):
         attn_bias = None
         if mask is not None:
             attn_bias = xformers.ops.fmha.BlockDiagonalMask.from_seqlens([N] * B, mask)
-        x = xformers.ops.memory_efficient_attention(q, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
+        x = xformers.ops.memory_efficient_attention(
+            q, k, v, p=self.attn_drop.p, attn_bias=attn_bias, op=_get_xformers_op()
+        )
 
         # apply all to all to gather back attention heads and scatter sequence
         x = x.view(B, -1, self.num_heads // sp_size, self.head_dim)

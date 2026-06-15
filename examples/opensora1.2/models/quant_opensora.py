@@ -23,11 +23,18 @@ from qdiff.utils import apply_func_to_submodules
 from qdiff.base.quant_model import quant_layer_refactor_, bitwidth_refactor_, load_quant_param_dict_, save_quant_param_dict_, set_init_done_
 from qdiff.base.quant_attn import QuantizedAttentionMapOpenSORA
 
-from models.quant_opensora_cuda import quantize_and_save_weight_, STDiT3BlockWithCudaKernel
-
-
 import logging
 logger = logging.getLogger(__name__)
+
+def resolve_opensora_checkpoint_path(from_pretrained):
+    if from_pretrained is None:
+        return from_pretrained
+    if os.path.isdir(from_pretrained):
+        safetensors_path = os.path.join(from_pretrained, "model.safetensors")
+        if os.path.isfile(safetensors_path):
+            logger.info("Loading HuggingFace safetensors checkpoint from %s", safetensors_path)
+            return safetensors_path
+    return from_pretrained
 
 class QuantOpenSora(STDiT3):
     def __init__(
@@ -37,6 +44,7 @@ class QuantOpenSora(STDiT3):
         from_pretrained
     ): 
         super().__init__(config)
+        from_pretrained = resolve_opensora_checkpoint_path(from_pretrained)
         load_checkpoint(self, from_pretrained)
 
         self.quant_config=quant_config
@@ -101,6 +109,7 @@ class QuantOpenSora(STDiT3):
         
     # ------ used for infer with CUDA kernel ------- 
     def quantize_and_save_weight(self, save_path):
+        from models.quant_opensora_cuda import quantize_and_save_weight_
 
         # set require_grad=False, since torch force the variable to be FP or complex (we assign them as torch.int8)
         for param in self.parameters():
@@ -152,6 +161,7 @@ class QuantOpenSora(STDiT3):
 
     def hardware_forward_refactor(self, load_path):
 
+        from models.quant_opensora_cuda import STDiT3BlockWithCudaKernel
         from viditq_extension.nn.base import QuantParams
 
         # (1) Set the seq_len to init the QuantParams 
@@ -179,61 +189,116 @@ class QuantOpenSora(STDiT3):
         seq_len = 2*num_patch # 2*token_len, currently only support batch_size=1
         self.quant_params = QuantParams(seq_len, has_sum_input=True, device=torch.device("cuda"))
 
-        # (2) replace the blocks, with cuda kernel version        
+        # (2) replace the blocks, with cuda kernel version
+        from viditq_extension.nn.viditq_linear import (
+            create_viditq_cuda_linear, ViDiTQW8A8Linear, ViDiTQW4A8Linear
+        )
+        from viditq_extension.nn.qlinear import W4A8OF16LinearDynamicInputScale
+        from models.quant_opensora_cuda import _is_viditq_layer
+
+        def _replace_block_with_cuda(block_list, old_block, temporal, i_block):
+            """Replace a single STDiT3 block with STDiT3BlockWithCudaKernel.
+
+            For ViDiT-Q blocks (11-14): uses AttentionWithCudaKernel + ViDiTQW8A8Linear
+            for self-attention qkv/proj (full CUDA kernel path).
+            For standard blocks: keeps original QuantizedAttention (software quant path).
+            All blocks: cross_attn.kv_linear stays as original ViDiTQuantizedLinear
+            (needed for activation quantization of text-condition K/V).
+            """
+            is_viditq = _is_viditq_layer(old_block.attn.qkv) if hasattr(old_block.attn, 'qkv') else False
+            old_attn = old_block.attn
+            old_cross_attn_kv_linear = old_block.cross_attn.kv_linear
+
+            use_kernel = [True, True, True] if is_viditq else None  # None = default [False, True, True]
+            new_block = STDiT3BlockWithCudaKernel(
+                hidden_size=old_block.hidden_size,
+                num_heads=old_block.attn.num_heads,
+                qk_norm=True,
+                temporal=temporal,
+                rope=old_block.rotary_emb if hasattr(old_block, 'rotary_emb') else None,
+                quant_params=self.quant_params,
+                use_kernel_override=use_kernel,
+            ).half().to('cuda')
+
+            if is_viditq:
+                # Determine if this ViDiT-Q block uses W4A8 or W8A8
+                # W4A8 requires: n_bits==4 AND C_in/G groups are even (QServe kernel limit)
+                old_qkv = old_block.attn.qkv
+                G = 128
+                use_w4a8 = (hasattr(old_qkv, 'w_quantizer') and
+                            hasattr(old_qkv.w_quantizer, 'n_bits') and
+                            int(old_qkv.w_quantizer.n_bits) == 4 and
+                            (old_qkv.in_features // G) % 2 == 0)
+
+                if use_w4a8:
+                    # ViDiT-Q preprocessing + W4A8 GEMM
+                    viditq_qkv = ViDiTQW4A8Linear(
+                        in_features=old_qkv.in_features,
+                        out_features=old_qkv.out_features,
+                        channel_mask=old_qkv.channel_mask.detach().clone(),
+                        random_signs=old_qkv.random_signs if hasattr(old_qkv, 'random_signs') else None,
+                    ).half().cuda()
+                    viditq_proj = ViDiTQW4A8Linear(
+                        in_features=old_block.attn.proj.in_features,
+                        out_features=old_block.attn.proj.out_features,
+                        channel_mask=old_block.attn.proj.channel_mask.detach().clone(),
+                        random_signs=old_block.attn.proj.random_signs if hasattr(old_block.attn.proj, 'random_signs') else None,
+                    ).half().cuda()
+                    # Also swap cross_attn.q_linear/proj and mlp to W4A8
+                    new_block.cross_attn.q_linear = W4A8OF16LinearDynamicInputScale(
+                        old_block.cross_attn.q_linear.in_features,
+                        old_block.cross_attn.q_linear.out_features,
+                    ).half().cuda()
+                    new_block.cross_attn.proj = W4A8OF16LinearDynamicInputScale(
+                        old_block.cross_attn.proj.in_features,
+                        old_block.cross_attn.proj.out_features,
+                    ).half().cuda()
+                    new_block.mlp.fc1 = W4A8OF16LinearDynamicInputScale(
+                        old_block.mlp.fc1.in_features,
+                        old_block.mlp.fc1.out_features,
+                    ).half().cuda()
+                    new_block.mlp.fc2 = W4A8OF16LinearDynamicInputScale(
+                        old_block.mlp.fc2.in_features,
+                        old_block.mlp.fc2.out_features,
+                    ).half().cuda()
+                    logger.info("ViDiT-Q %s block %d: W4A8 (ViDiTQ + QServe kernel)",
+                                "temporal" if temporal else "spatial", i_block)
+                else:
+                    # Standard W8A8 path
+                    viditq_qkv = create_viditq_cuda_linear(old_qkv, weight_sym=False).half().cuda()
+                    viditq_proj = create_viditq_cuda_linear(old_block.attn.proj, weight_sym=False).half().cuda()
+                    logger.info("ViDiT-Q %s block %d: W8A8 (ViDiTQ fused kernel)",
+                                "temporal" if temporal else "spatial", i_block)
+
+                new_block.attn.qkv = viditq_qkv
+                new_block.attn.proj = viditq_proj
+            else:
+                # Keep original QuantizedAttention (software quant path)
+                new_block.attn = old_attn
+
+            # All blocks: keep original cross_attn.kv_linear (ViDiTQuantizedLinear for activation quant)
+            new_block.cross_attn.kv_linear = old_cross_attn_kv_linear
+            block_list[i_block] = new_block
+
         n_block = len(self.spatial_blocks)
-        for i_block in range(n_block):      
-            
-            old_block = self.spatial_blocks[i_block]
-            
-            # DEBUG_ONLY: replace some layer as old.
-            old_attn = old_block.attn
-            # old_cross_attn = old_block.cross_attn
-            # old_mlp = old_block.mlp
-            # old_attn_proj =  old_block.attn.proj
-            
-            self.spatial_blocks[i_block] = STDiT3BlockWithCudaKernel(
-                    hidden_size=old_block.hidden_size,
-                    num_heads=old_block.attn.num_heads,
-                    qk_norm=True,
-                    temporal=False,
-                    rope=old_block.rotary_emb if hasattr(old_block, 'rotary_emb') else None,
-                    quant_params=self.quant_params,
-                ).half().to('cuda')
-
-            # DEBUG_ONLY: replace some layer as old.
-            self.spatial_blocks[i_block].attn = old_attn
-            # self.spatial_blocks[i_block].cross_attn = old_cross_attn
-            # self.spatial_blocks[i_block].mlp = old_mlp
-            # self.spatial_blocks[i_block].attn.proj = old_attn_proj
-      
-            old_block = self.temporal_blocks[i_block]    
-            # DEBUG_ONLY: replace some layer as old.
-            old_attn = old_block.attn
-            # old_cross_attn = old_block.cross_attn
-            # old_mlp = old_block.mlp
-            # old_attn_proj =  old_block.attn.proj
-
-            self.temporal_blocks[i_block] = STDiT3BlockWithCudaKernel(
-                    hidden_size=old_block.hidden_size,
-                    num_heads=old_block.attn.num_heads,
-                    qk_norm=True,
-                    temporal=True,
-                    rope=old_block.rotary_emb if hasattr(old_block, 'rotary_emb') else None,
-                    quant_params=self.quant_params,
-                ).half().to('cuda')
-            
-            # DEBUG_ONLY: replace some layer as old.
-            self.temporal_blocks[i_block].attn = old_attn
-            # self.temporal_blocks[i_block].cross_attn = old_cross_attn
-            # self.temporal_blocks[i_block].mlp = old_mlp
-            # self.temporal_blocks[i_block].attn.proj = old_attn_proj
-            
-            setattr(self.spatial_blocks[i_block],'block_id',i_block)
-            setattr(self.temporal_blocks[i_block],'block_id',i_block)
+        for i_block in range(n_block):
+            _replace_block_with_cuda(self.spatial_blocks, self.spatial_blocks[i_block], temporal=False, i_block=i_block)
+            _replace_block_with_cuda(self.temporal_blocks, self.temporal_blocks[i_block], temporal=True, i_block=i_block)
+            setattr(self.spatial_blocks[i_block], 'block_id', i_block)
+            setattr(self.temporal_blocks[i_block], 'block_id', i_block)
 
         # (3) load the integer weights
         quant_sd = torch.load(load_path, weights_only=True, map_location='cuda')
         self.load_state_dict(quant_sd, strict=False)
+
+        # (3b) Ensure all ViDiTQW8A8Linear buffers are on CUDA after load
+        from viditq_extension.nn.viditq_linear import ViDiTQW8A8Linear
+        for name, module in self.named_modules():
+            if isinstance(module, ViDiTQW8A8Linear):
+                for buf_name, buf in module.named_buffers():
+                    if not buf.is_cuda:
+                        module._buffers[buf_name] = buf.cuda()
+                        logger.warning("Moved %s.%s to CUDA after load_state_dict", name, buf_name)
 
     # ------------------------------------------------------------------------------------
         
@@ -601,4 +666,3 @@ class QuantizedMultiHeadCrossAttention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
-

@@ -54,7 +54,23 @@ torch::Tensor gate_residual_fuse(torch::Tensor &input,  // [batch_size * tokens,
               torch::Tensor &residual // [batch_size * tokens, hidden_size]
               );
 
+// ViDiT-Q fused kernels
+torch::Tensor viditq_act_quant_fuse(
+    torch::Tensor input, torch::Tensor channel_mask,
+    torch::Tensor random_signs, torch::Tensor hadK,
+    torch::Tensor scale_output, torch::Tensor sum_output);
+
+torch::Tensor channel_scale_quant(
+    torch::Tensor input, torch::Tensor channel_mask,
+    torch::Tensor scale_output, torch::Tensor sum_output);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("viditq_act_quant_fuse", &viditq_act_quant_fuse,
+        "ViDiT-Q fused: channel_mask + random_sign + FWHT + hadK + quantization");
+
+  m.def("channel_scale_quant", &channel_scale_quant,
+        "channel_mask scaling + quantization (no FWHT/hadK)");
+
   m.def("quant_sum", &quant_sum,
         "quantization kernel, output sum");
   

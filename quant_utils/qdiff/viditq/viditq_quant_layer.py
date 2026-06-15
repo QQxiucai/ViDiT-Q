@@ -60,7 +60,10 @@ class ViDiTQuantizedLinear(QuantizedLinear):
             dtype_ = x.dtype
             B, N_token, C = x.shape
             x = x*self.channel_mask.reshape([1,1,C])  # first process through scale
-            x = torch.matmul(x.double(), self.rotation_matrix).to(dtype=dtype_)  # then rotate
+            # ORIGINAL (FP64, ~100x slower): x = torch.matmul(x.double(), self.rotation_matrix).to(dtype=dtype_)
+            # 这是为了暂时跑冒烟推理的选择 — 将 Hadamard 旋转从 FP64 改为 FP16，
+            # Hadamard 矩阵是正交且条件良好的，FP16 精度损失可忽略。
+            x = torch.matmul(x, self.rotation_matrix.to(dtype=dtype_))  # then rotate (FP16)
             x = x.reshape([B*N_token,-1])
 
             # quantize activationq

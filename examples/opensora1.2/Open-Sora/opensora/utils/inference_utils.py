@@ -173,6 +173,11 @@ def find_nearest_point(value, point, max_value):
 
 
 def apply_mask_strategy(z, refs_x, mask_strategys, loop_i, align=None):
+    # 纯文生视频没有参考帧时，空 mask_strategy 不应构造全 1 mask，
+    # 否则会误触发 scheduler 的 x_mask 分支。
+    if mask_strategys is None or all(mask_strategy == "" or mask_strategy is None for mask_strategy in mask_strategys):
+        return None
+
     masks = []
     no_mask = True
     for i, mask_strategy in enumerate(mask_strategys):
